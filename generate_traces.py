@@ -2,7 +2,7 @@ import os
 import numpy as np
 import h5py
 from rainbow import Rainbow
-from rainbow.generics import *
+from unicorn import UC_HOOK_MEM_WRITE, UC_HOOK_MEM_READ
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -48,8 +48,8 @@ def generate_dataset(rainbow, num_traces, fixed_key=None):
         # Addresses (placeholders - will be resolved from ELF symbols)
         # Assuming we have a wrapper or we call ascon128_init directly
         try:
-            init_addr = rainbow.functions["ascon128_init"]
-            encrypt_addr = rainbow.functions["ascon128_encrypt"]
+            init_addr = rainbow.functions["ascon128_init"][0]
+            encrypt_addr = rainbow.functions["ascon128_encrypt"][0]
         except KeyError:
             # Fallback to manual address if symbols are missing (example addresses)
             init_addr = 0x08000000 
@@ -62,41 +62,49 @@ def generate_dataset(rainbow, num_traces, fixed_key=None):
         pt_addr = 0x20000050
         ct_addr = 0x20000060
 
-        rainbow.mem_write(key_addr, current_key.tobytes())
-        rainbow.mem_write(nonce_addr, current_nonce.tobytes())
-        rainbow.mem_write(pt_addr, current_pt.tobytes())
+        try:
+            rainbow.emu.mem_map(0x20000000, 0x1000)
+        except Exception:
+            pass
+
+        rainbow[key_addr] = current_key.tobytes()
+        rainbow[nonce_addr] = current_nonce.tobytes()
+        rainbow[pt_addr] = current_pt.tobytes()
 
         # Trace capture
         trace = []
         target_val = 0
 
-        def power_hook(emu, address, size, value):
+        def power_hook(emu, access, address, size, value, user_data):
             # Simple Hamming Weight Leakage Model
             # We assume power leakage is proportional to the HW of the value being moved/processed
             leakage = get_hamming_weight(value & 0xFFFFFFFF)
             trace.append(leakage)
-
-        def intermediate_hook(emu, address, size, value):
             nonlocal target_val
             # Target: The value of state[0] after the first S-box layer
-            # This requires identifying the specific instruction or memory write
-            # For this simulation, we'll capture it when state[0] is written
-            if address == state_addr:
+            if address == state_addr and access == UC_HOOK_MEM_WRITE:
                 target_val = value
 
         # Register hooks
-        rainbow.add_hook(HOOK_MEM_WRITE | HOOK_MEM_READ, power_hook)
-        # Note: In a real scenario, you'd find the exact instruction offset for the S-box
-        # Here we simulate by capturing the first state update in encryption
+        h = rainbow.emu.hook_add(UC_HOOK_MEM_WRITE | UC_HOOK_MEM_READ, power_hook)
         
         # Execution
         # 1. Init
-        rainbow.setup_call(init_addr, [state_addr, key_addr, nonce_addr])
-        rainbow.emu_start(init_addr, until=init_addr + 0x100) # Dummy end
+        rainbow["r0"] = state_addr
+        rainbow["r1"] = key_addr
+        rainbow["r2"] = nonce_addr
+        rainbow["lr"] = 0x10000000
+        rainbow.start(init_addr | 1, 0x10000000)
         
         # 2. Encrypt (where we capture the target)
-        rainbow.setup_call(encrypt_addr, [state_addr, ct_addr, pt_addr, 8])
-        rainbow.emu_start(encrypt_addr, until=encrypt_addr + 0x200)
+        rainbow["r0"] = state_addr
+        rainbow["r1"] = ct_addr
+        rainbow["r2"] = pt_addr
+        rainbow["r3"] = 8
+        rainbow["lr"] = 0x10000000
+        rainbow.start(encrypt_addr | 1, 0x10000000)
+
+        rainbow.emu.hook_del(h)
 
         # Store data
         traces.append(trace)
@@ -129,7 +137,8 @@ def main():
 
     # Initialize Rainbow
     try:
-        e = Rainbow()
+        from rainbow.generics import rainbow_arm
+        e = rainbow_arm()
         e.load(BINARY_PATH)
     except Exception as ex:
         print(f"Rainbow initialization failed: {ex}")
